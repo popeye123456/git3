@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Umpire LBW Assistant Serverless Architecture Backend
+
+Resources:
+  # 1. S3 Bucket for Video Uploads with CORS
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: lbw-video-uploads
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - PUT
+              - POST
+              - GET
+            AllowedOrigins:
+              - "*" # In production, restrict to your frontend domain
+            MaxAge: 3000
+
+  # 2. Serverless Lambda Function (Image type) for LBW Backend AI
+  LBWBackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      # The ECR image URI will be injected by the CI/CD pipeline/manual deploy
+      # ImageUri: <ecr-repo-uri>:latest 
+      MemorySize: 2048
+      Timeout: 60
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        VideoUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref UploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: '.mp4'
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./backend
+      DockerTag: latest
+
+  # 3. API Gateway / Lambda endpoint for returning secure Pre-signed S3 Upload URLs
+  PresignedUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      InlineCode: |
+        import json
+        import boto3
+        import uuid
+        s3 = boto3.client('s3')
+        def handler(event, context):
+            file_name = f"{uuid.uuid4()}.mp4"
+            bucket = "lbw-video-uploads" 
+            url = s3.generate_presigned_url(
+                ClientMethod='put_object',
+                Params={'Bucket': bucket, 'Key': file_name, 'ContentType': 'video/mp4'},
+                ExpiresIn=3600
+            )
+            return {
+                "statusCode": 200,
+                "headers": {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Headers": "Content-Type",
+                    "Access-Control-Allow-Methods": "OPTIONS,GET"
+                },
+                "body": json.dumps({"uploadUrl": url, "key": file_name})
+            }
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        ApiEndpoint:
+          Type: Api
+          Properties:
+            Path: /upload-url
+            Method: GET
+
+Outputs:
+  UploadApiEndpoint:
+    Description: "API Gateway endpoint URL to get Presigned S3 URLs"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/upload-url"
